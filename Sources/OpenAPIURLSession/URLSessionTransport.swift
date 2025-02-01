@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 import OpenAPIRuntime
+import HTTPTypes
 #if canImport(Darwin)
 import Foundation
 #else
@@ -89,14 +90,13 @@ public struct URLSessionTransport: ClientTransport {
         self.configuration = configuration
     }
 
-    public func send(
-        _ request: OpenAPIRuntime.Request,
-        baseURL: URL,
-        operationID: String
-    ) async throws -> OpenAPIRuntime.Response {
+    public func send(_ request: HTTPRequest, body requestBody: HTTPBody?, baseURL: URL, operationID: String)
+    async throws -> (HTTPResponse, HTTPBody?) {
         let urlRequest = try URLRequest(request, baseURL: baseURL)
         let (responseBody, urlResponse) = try await invokeSession(urlRequest)
-        return try OpenAPIRuntime.Response(from: urlResponse, body: responseBody)
+        let response = try HTTPResponse(urlResponse)
+        let body = HTTPBody(responseBody)
+        return (response, body)
     }
 
     private func invokeSession(_ urlRequest: URLRequest) async throws -> (Data, URLResponse) {
@@ -125,19 +125,7 @@ public struct URLSessionTransport: ClientTransport {
     }
 }
 
-/// Specialized error thrown by the transport.
-internal enum URLSessionTransportError: Error {
-
-    /// Invalid URL composed from base URL and received request.
-    case invalidRequestURL(request: OpenAPIRuntime.Request, baseURL: URL)
-
-    /// Returned `URLResponse` could not be converted to `HTTPURLResponse`.
-    case notHTTPResponse(URLResponse)
-
-    /// Returned `URLResponse` was nil
-    case noResponse(url: URL?)
-}
-
+/*
 extension OpenAPIRuntime.Response {
     init(from urlResponse: URLResponse, body: Data) throws {
         guard let httpResponse = urlResponse as? HTTPURLResponse else {
@@ -175,21 +163,140 @@ extension URLRequest {
         }
     }
 }
+*/
+extension HTTPBody.Length {
+    init(from urlResponse: URLResponse) {
+        if urlResponse.expectedContentLength == -1 {
+            self = .unknown
+        } else {
+            self = .known(urlResponse.expectedContentLength)
+        }
+    }
+}
 
+/// Specialized error thrown by the transport.
+internal enum URLSessionTransportError: Error {
+    
+    /// Invalid URL composed from base URL and received request.
+    case invalidRequestURL(path: String, method: HTTPRequest.Method, baseURL: URL)
+    
+    /// Returned `URLResponse` could not be converted to `HTTPURLResponse`.
+    case notHTTPResponse(URLResponse)
+    
+    /// Returned `HTTPURLResponse` has an invalid status code
+    case invalidResponseStatusCode(HTTPURLResponse)
+    
+    /// Returned `URLResponse` was nil
+    case noResponse(url: URL?)
+    
+    /// Platform does not support streaming.
+    case streamingNotSupported
+}
+
+extension HTTPResponse {
+    init(_ urlResponse: URLResponse) throws {
+        guard let httpResponse = urlResponse as? HTTPURLResponse else {
+            throw URLSessionTransportError.notHTTPResponse(urlResponse)
+        }
+        guard (0...999).contains(httpResponse.statusCode) else {
+            throw URLSessionTransportError.invalidResponseStatusCode(httpResponse)
+        }
+        self.init(status: .init(code: httpResponse.statusCode))
+        if let fields = httpResponse.allHeaderFields as? [String: String] {
+            self.headerFields.reserveCapacity(fields.count)
+            for (name, value) in fields {
+                if let name = HTTPField.Name(name) {
+                    self.headerFields.append(HTTPField(name: name, isoLatin1Value: value))
+                }
+            }
+        }
+    }
+}
+
+extension String { fileprivate var isASCII: Bool { self.utf8.allSatisfy { $0 & 0x80 == 0 } } }
+
+extension HTTPField {
+    fileprivate init(name: Name, isoLatin1Value: String) {
+        if isoLatin1Value.isASCII {
+            self.init(name: name, value: isoLatin1Value)
+        } else {
+            self = withUnsafeTemporaryAllocation(of: UInt8.self, capacity: isoLatin1Value.unicodeScalars.count) {
+                buffer in
+                for (index, scalar) in isoLatin1Value.unicodeScalars.enumerated() {
+                    if scalar.value > UInt8.max {
+                        buffer[index] = 0x20
+                    } else {
+                        buffer[index] = UInt8(truncatingIfNeeded: scalar.value)
+                    }
+                }
+                return HTTPField(name: name, value: buffer)
+            }
+        }
+    }
+    
+    fileprivate var isoLatin1Value: String {
+        if self.value.isASCII { return self.value }
+        return self.withUnsafeBytesOfValue { buffer in
+            let scalars = buffer.lazy.map { UnicodeScalar(UInt32($0))! }
+            var string = ""
+            string.unicodeScalars.append(contentsOf: scalars)
+            return string
+        }
+    }
+}
+
+extension URLRequest {
+    init(_ request: HTTPRequest, baseURL: URL) throws {
+        guard var baseUrlComponents = URLComponents(string: baseURL.absoluteString),
+              let requestUrlComponents = URLComponents(string: request.path ?? "")
+        else {
+            throw URLSessionTransportError.invalidRequestURL(
+                path: request.path ?? "<nil>",
+                method: request.method,
+                baseURL: baseURL
+            )
+        }
+        
+        let path = requestUrlComponents.percentEncodedPath
+        baseUrlComponents.percentEncodedPath += path
+        baseUrlComponents.percentEncodedQuery = requestUrlComponents.percentEncodedQuery
+        guard let url = baseUrlComponents.url else {
+            throw URLSessionTransportError.invalidRequestURL(path: path, method: request.method, baseURL: baseURL)
+        }
+        self.init(url: url)
+        self.httpMethod = request.method.rawValue
+        var combinedFields = [HTTPField.Name: String](minimumCapacity: request.headerFields.count)
+        for field in request.headerFields {
+            if let existingValue = combinedFields[field.name] {
+                let separator = field.name == .cookie ? "; " : ", "
+                combinedFields[field.name] = "\(existingValue)\(separator)\(field.isoLatin1Value)"
+            } else {
+                combinedFields[field.name] = field.isoLatin1Value
+            }
+        }
+        var headerFields = [String: String](minimumCapacity: combinedFields.count)
+        for (name, value) in combinedFields { headerFields[name.rawName] = value }
+        self.allHTTPHeaderFields = headerFields
+    }
+}
+ 
 extension URLSessionTransportError: LocalizedError {
-    public var errorDescription: String? { description }
+    /// A localized message describing what error occurred.
+    var errorDescription: String? { description }
 }
 
 extension URLSessionTransportError: CustomStringConvertible {
-    public var description: String {
+    /// A textual representation of this instance.
+    var description: String {
         switch self {
-        case let .invalidRequestURL(request: request, baseURL: baseURL):
-            return
-                "Invalid request URL from request path: \(request.path), query: \(request.query ?? "<nil>") relative to base URL: \(baseURL.absoluteString)"
+        case let .invalidRequestURL(path: path, method: method, baseURL: baseURL):
+            return "Invalid request URL from request path: \(path), method: \(method), relative to base URL: \(baseURL.absoluteString)"
         case .notHTTPResponse(let response):
             return "Received a non-HTTP response, of type: \(String(describing: type(of: response)))"
-        case .noResponse(let url):
-            return "Received a nil response for \(url?.absoluteString ?? "<nil URL>")"
+        case .invalidResponseStatusCode(let response):
+            return "Received an HTTP response with invalid status code: \(response.statusCode))"
+        case .noResponse(let url): return "Received a nil response for \(url?.absoluteString ?? "<nil URL>")"
+        case .streamingNotSupported: return "Streaming is not supported on this platform"
         }
     }
 }
